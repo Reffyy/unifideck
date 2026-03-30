@@ -40,6 +40,8 @@ class GameVaultConnector(Store):
         self.user_id: Optional[str] = None
         self.username: Optional[str] = None
         self.token_time: float = 0  # epoch when tokens were last saved/refreshed
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_lock = asyncio.Lock()
 
         self._load_tokens()
         logger.info("[GameVault] Connector initialized")
@@ -134,38 +136,114 @@ class GameVaultConnector(Store):
         return True
 
     async def _refresh_access_token(self) -> bool:
-        """Refresh the access token using refresh token"""
+        """Refresh the access token using refresh token (lock-protected)"""
         if not self.refresh_token or not self.server_url:
             return False
 
-        try:
-            ssl_context = self._get_ssl_context()
-            timeout = aiohttp.ClientTimeout(total=10.0)
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
+        async with self._refresh_lock:
+            # Another caller may have refreshed while we waited for the lock
+            if time.time() - self.token_time < 30:
+                logger.debug("[GameVault] Token recently refreshed, skipping")
+                return True
 
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.post(
-                    f"{self.server_url}/api/auth/refresh",
-                    headers={"Authorization": f"Bearer {self.refresh_token}"}
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        self._save_tokens(
-                            server_url=self.server_url,
-                            access_token=data.get('access_token', ''),
-                            refresh_token=data.get('refresh_token', self.refresh_token),
-                            user_id=self.user_id or '',
-                            username=self.username or '',
-                        )
-                        logger.info("[GameVault] Token refreshed successfully")
-                        return True
+            try:
+                ssl_context = self._get_ssl_context()
+                timeout = aiohttp.ClientTimeout(total=10.0)
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.post(
+                        f"{self.server_url}/api/auth/refresh",
+                        headers={"Authorization": f"Bearer {self.refresh_token}"}
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self._save_tokens(
+                                server_url=self.server_url,
+                                access_token=data.get('access_token', ''),
+                                refresh_token=data.get('refresh_token', self.refresh_token),
+                                user_id=self.user_id or '',
+                                username=self.username or '',
+                            )
+                            logger.info("[GameVault] Token refreshed successfully")
+                            return True
+                        else:
+                            error_text = await response.text()
+                            logger.warning(f"[GameVault] Token refresh failed ({response.status}): {error_text}")
+                            return False
+            except Exception as e:
+                logger.error(f"[GameVault] Token refresh error: {e}")
+                return False
+
+    # ── Background token refresh ───────────────────────────────────
+
+    def start_token_refresh_loop(self):
+        """Start background token refresh loop to keep session alive"""
+        if self._refresh_task and not self._refresh_task.done():
+            logger.debug("[GameVault] Refresh loop already running")
+            return
+        if not self.access_token or not self.refresh_token:
+            logger.debug("[GameVault] No tokens, not starting refresh loop")
+            return
+        self._refresh_task = asyncio.create_task(self._token_refresh_loop())
+        logger.info("[GameVault] Background token refresh loop started")
+
+    def stop_token_refresh_loop(self):
+        """Stop the background token refresh loop"""
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+            logger.info("[GameVault] Background token refresh loop stopped")
+        self._refresh_task = None
+
+    async def _token_refresh_loop(self):
+        """Background loop that keeps access tokens fresh.
+
+        Refreshes every 3 minutes (well before the 5-minute access token expiry).
+        Stops after 3 consecutive failures — the refresh token has likely expired.
+        """
+        REFRESH_INTERVAL = 180  # 3 minutes
+        RETRY_INTERVAL = 30
+        MAX_FAILURES = 3
+        consecutive_failures = 0
+        try:
+            while True:
+                await asyncio.sleep(REFRESH_INTERVAL if consecutive_failures == 0 else RETRY_INTERVAL)
+                try:
+                    if await self._refresh_access_token():
+                        consecutive_failures = 0
+                        logger.debug("[GameVault] Background token refresh succeeded")
                     else:
-                        error_text = await response.text()
-                        logger.warning(f"[GameVault] Token refresh failed ({response.status}): {error_text}")
-                        return False
-        except Exception as e:
-            logger.error(f"[GameVault] Token refresh error: {e}")
-            return False
+                        consecutive_failures += 1
+                        logger.warning(
+                            f"[GameVault] Background token refresh failed "
+                            f"({consecutive_failures}/{MAX_FAILURES})"
+                        )
+                except Exception as e:
+                    consecutive_failures += 1
+                    logger.error(f"[GameVault] Background refresh error: {e}")
+                if consecutive_failures >= MAX_FAILURES:
+                    logger.error(
+                        "[GameVault] Background refresh failed %d times — "
+                        "refresh token likely expired. User must re-login.",
+                        MAX_FAILURES,
+                    )
+                    break
+        except asyncio.CancelledError:
+            logger.info("[GameVault] Background refresh loop cancelled")
+
+    async def initialize_async(self):
+        """Async initialization — call after event loop is available.
+
+        Validates stored tokens and starts background refresh if valid.
+        """
+        if not self.access_token or not self.refresh_token:
+            return
+        refreshed = await self._refresh_access_token()
+        if refreshed:
+            self.start_token_refresh_loop()
+            logger.info("[GameVault] Resumed session with background refresh")
+        else:
+            logger.warning("[GameVault] Stored tokens expired, user must re-login")
 
     async def _api_request(self, method: str, path: str, timeout_seconds: float = 15.0, **kwargs) -> Optional[aiohttp.ClientResponse]:
         """Make an authenticated API request to the GameVault server.
@@ -302,6 +380,7 @@ class GameVaultConnector(Store):
                             username=username,
                         )
                         logger.info(f"[GameVault] Login successful for {username}")
+                        self.start_token_refresh_loop()
 
                         # Trigger auto-sync if plugin instance available
                         if self.plugin_instance and hasattr(self.plugin_instance, 'sync_on_auth'):
@@ -331,6 +410,7 @@ class GameVaultConnector(Store):
 
     async def logout(self) -> Dict[str, Any]:
         """Logout from GameVault, clearing stored credentials"""
+        self.stop_token_refresh_loop()
         try:
             # Best-effort token revocation
             if self.access_token and self.server_url:
@@ -511,7 +591,7 @@ class GameVaultConnector(Store):
                         ext = '.zip'
 
                     # Create temp file for download
-                    temp_fd, temp_archive = tempfile.mkstemp(suffix=ext, prefix=f'gv_{game_id}_')
+                    temp_fd, temp_archive = tempfile.mkstemp(suffix=ext, prefix=f'gv_{game_id}_', dir=install_path)
                     os.close(temp_fd)
 
                     with open(temp_archive, 'wb') as f:

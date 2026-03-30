@@ -2141,6 +2141,7 @@ class Plugin:
 
         logger.info("[INIT] Initializing GameVaultConnector")
         self.gamevault = GameVaultConnector(plugin_dir=DECKY_PLUGIN_DIR, plugin_instance=self)
+        await self.gamevault.initialize_async()
 
         # Ensure the Microsoft auth shortcut is in VDF on every startup.
         # This mirrors the Ubisoft pattern above — the shortcut must exist
@@ -7268,6 +7269,9 @@ microsoft_client=self.microsoft,
 
     async def _unload(self):
         """Cleanup on plugin unload"""
+        if hasattr(self, 'gamevault') and self.gamevault:
+            self.gamevault.stop_token_refresh_loop()
+
         logger.info("[UNLOAD] Stopping background sync service")
         if self.background_sync:
             await self.background_sync.stop()
