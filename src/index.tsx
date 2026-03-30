@@ -754,6 +754,12 @@ const Content: FC = () => {
     checkStoreStatus();
   }, []);
 
+  useEffect(() => {
+    // Periodically re-check store status to catch session expiry
+    const id = setInterval(() => { checkStoreStatus(); }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // Restore sync state on mount (in case user navigated away during sync)
   useEffect(() => {
     const restoreSyncState = async () => {
