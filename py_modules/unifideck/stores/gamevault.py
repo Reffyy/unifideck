@@ -11,6 +11,7 @@ import logging
 import os
 import ssl
 import shutil
+import sys
 import tempfile
 import time
 import zipfile
@@ -39,6 +40,7 @@ class GameVaultConnector(Store):
         self.refresh_token: Optional[str] = None
         self.user_id: Optional[str] = None
         self.username: Optional[str] = None
+        self._stored_password: Optional[str] = None
         self.token_time: float = 0  # epoch when tokens were last saved/refreshed
         self._refresh_task: Optional[asyncio.Task] = None
         self._refresh_lock = asyncio.Lock()
@@ -65,31 +67,46 @@ class GameVaultConnector(Store):
                     self.refresh_token = data.get('refresh_token')
                     self.user_id = data.get('user_id')
                     self.username = data.get('username')
+                    self._stored_password = data.get('password')
                     self.token_time = data.get('token_time', 0)
                     logger.info(f"[GameVault] Loaded tokens for {self.username}@{self.server_url}")
         except Exception as e:
             logger.error(f"[GameVault] Error loading tokens: {e}")
 
     def _save_tokens(self, server_url: str, access_token: str, refresh_token: str,
-                     user_id: str = "", username: str = ""):
-        """Save auth tokens to disk"""
+                     user_id: str = "", username: str = "", password: Optional[str] = None):
+        """Save auth tokens to disk.
+
+        When *password* is None (e.g. during a token-refresh save) the
+        previously-loaded password is preserved so credentials survive
+        across refresh cycles.
+        """
         try:
             os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
             now = time.time()
-            with open(self.token_file, 'w') as f:
-                json.dump({
-                    'server_url': server_url,
-                    'access_token': access_token,
-                    'refresh_token': refresh_token,
-                    'user_id': user_id,
-                    'username': username,
-                    'token_time': now,
-                }, f)
+            effective_password = password if password is not None else self._stored_password
+            data = {
+                'server_url': server_url,
+                'access_token': access_token,
+                'refresh_token': refresh_token,
+                'user_id': user_id,
+                'username': username,
+                'password': effective_password,
+                'token_time': now,
+            }
+            if sys.platform != 'win32':
+                fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(data, f)
+            else:
+                with open(self.token_file, 'w') as f:
+                    json.dump(data, f)
             self.server_url = server_url
             self.access_token = access_token
             self.refresh_token = refresh_token
             self.user_id = user_id
             self.username = username
+            self._stored_password = effective_password
             self.token_time = now
             logger.info(f"[GameVault] Saved tokens for {username}@{server_url}")
         except Exception as e:
@@ -102,6 +119,7 @@ class GameVaultConnector(Store):
         self.refresh_token = None
         self.user_id = None
         self.username = None
+        self._stored_password = None
         self.token_time = 0
         try:
             if os.path.exists(self.token_file):
@@ -175,6 +193,49 @@ class GameVaultConnector(Store):
                 logger.error(f"[GameVault] Token refresh error: {e}")
                 return False
 
+    async def _relogin(self) -> bool:
+        """Re-authenticate using stored credentials (Basic Auth -> JWT).
+
+        This is a low-level helper that does NOT start the refresh loop —
+        callers decide whether to (re)start it themselves.
+        """
+        if not self.server_url or not self.username or not self._stored_password:
+            logger.warning("[GameVault] Cannot re-login: no stored credentials")
+            return False
+
+        logger.info(f"[GameVault] Attempting automatic re-login for {self.username}@{self.server_url}")
+        try:
+            ssl_context = self._get_ssl_context()
+            timeout = aiohttp.ClientTimeout(total=10.0)
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            credentials = base64.b64encode(
+                f"{self.username}:{self._stored_password}".encode()
+            ).decode()
+
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(
+                    f"{self.server_url}/api/auth/basic/login",
+                    headers={"Authorization": f"Basic {credentials}"}
+                ) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        self._save_tokens(
+                            server_url=self.server_url,
+                            access_token=data.get("access_token", ""),
+                            refresh_token=data.get("refresh_token", ""),
+                            user_id=self.user_id or "",
+                            username=self.username,
+                            password=self._stored_password,
+                        )
+                        logger.info("[GameVault] Automatic re-login succeeded")
+                        return True
+                    else:
+                        logger.warning(f"[GameVault] Re-login failed ({response.status})")
+                        return False
+        except Exception as e:
+            logger.error(f"[GameVault] Re-login error: {e}")
+            return False
+
     # ── Background token refresh ───────────────────────────────────
 
     def start_token_refresh_loop(self):
@@ -222,12 +283,18 @@ class GameVaultConnector(Store):
                     consecutive_failures += 1
                     logger.error(f"[GameVault] Background refresh error: {e}")
                 if consecutive_failures >= MAX_FAILURES:
-                    logger.error(
-                        "[GameVault] Background refresh failed %d times — "
-                        "refresh token likely expired. User must re-login.",
+                    logger.warning(
+                        "[GameVault] Background refresh failed %d times, "
+                        "attempting re-login with stored credentials...",
                         MAX_FAILURES,
                     )
-                    break
+                    if await self._relogin():
+                        consecutive_failures = 0
+                        logger.info("[GameVault] Re-login succeeded, resuming refresh loop")
+                        continue
+                    else:
+                        logger.error("[GameVault] Re-login also failed — session lost, user must re-login manually")
+                        break
         except asyncio.CancelledError:
             logger.info("[GameVault] Background refresh loop cancelled")
 
@@ -235,15 +302,31 @@ class GameVaultConnector(Store):
         """Async initialization — call after event loop is available.
 
         Validates stored tokens and starts background refresh if valid.
+        Falls back to re-login with stored credentials when refresh fails.
         """
         if not self.access_token or not self.refresh_token:
+            # No tokens — try re-login with stored credentials if available
+            if self.server_url and self.username and self._stored_password:
+                logger.info("[GameVault] No valid tokens but have stored credentials, attempting re-login...")
+                if await self._relogin():
+                    self.start_token_refresh_loop()
+                    logger.info("[GameVault] Resumed session via re-login")
+                else:
+                    logger.warning("[GameVault] Re-login failed during init, user must re-login manually")
             return
+
         refreshed = await self._refresh_access_token()
         if refreshed:
             self.start_token_refresh_loop()
             logger.info("[GameVault] Resumed session with background refresh")
         else:
-            logger.warning("[GameVault] Stored tokens expired, user must re-login")
+            # Token refresh failed — try re-login with stored credentials
+            logger.info("[GameVault] Token refresh failed, attempting re-login...")
+            if await self._relogin():
+                self.start_token_refresh_loop()
+                logger.info("[GameVault] Resumed session via re-login after failed refresh")
+            else:
+                logger.warning("[GameVault] Stored tokens expired and re-login failed, user must re-login")
 
     async def _api_request(self, method: str, path: str, timeout_seconds: float = 15.0, **kwargs) -> Optional[aiohttp.ClientResponse]:
         """Make an authenticated API request to the GameVault server.
@@ -291,8 +374,11 @@ class GameVaultConnector(Store):
                         return await response.json()
                     elif response.status == 401:
                         logger.warning(f"[GameVault] 401 on {path}, attempting refresh")
-                        if await self._refresh_access_token():
-                            # Retry once with new token
+                        recovered = await self._refresh_access_token()
+                        if not recovered:
+                            logger.warning(f"[GameVault] Refresh failed on 401, attempting re-login")
+                            recovered = await self._relogin()
+                        if recovered:
                             headers['Authorization'] = f'Bearer {self.access_token}'
                             async with session.request(method, f"{self.server_url}{path}", headers=headers, **kwargs) as retry_resp:
                                 if retry_resp.status == 200:
@@ -378,6 +464,7 @@ class GameVaultConnector(Store):
                             refresh_token=data.get('refresh_token', ''),
                             user_id=str(data.get('id', '')),
                             username=username,
+                            password=password,
                         )
                         logger.info(f"[GameVault] Login successful for {username}")
                         self.start_token_refresh_loop()
