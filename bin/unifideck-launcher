@@ -746,7 +746,7 @@ EXTRA_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         # Store:id pattern - this is the game key (checked first — no = in it)
-        epic:*|gog:*|amazon:*|ubisoft:*|microsoft:*)
+        epic:*|gog:*|amazon:*|ubisoft:*|microsoft:*|gamevault:*)
             KEY="$arg"
             ;;
         # Other arguments — check if it looks like a VAR=value env var
