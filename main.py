@@ -2379,6 +2379,61 @@ microsoft_client=self.microsoft,
                     else:
                         error_message = "Could not find Ubisoft install info"
                         logger.error(f"[DownloadComplete] {error_message} for {item.game_title}")
+                elif item.store == 'gamevault':
+                    # GameVault installs extract an archive to <install_path>/<safe_title>/
+                    # Find the game directory via .unifideck-id marker (written during extraction)
+                    install_path = self.download_queue.get_install_path(item.storage_location)
+                    game_install_path = None
+
+                    # Scan for marker file (robust identification)
+                    if os.path.exists(install_path):
+                        for folder in os.listdir(install_path):
+                            folder_path = os.path.join(install_path, folder)
+                            if os.path.isdir(folder_path):
+                                marker_path = os.path.join(folder_path, '.unifideck-id')
+                                if os.path.exists(marker_path):
+                                    try:
+                                        with open(marker_path, 'r') as f:
+                                            if f.read().strip() == str(item.game_id):
+                                                game_install_path = folder_path
+                                                break
+                                    except Exception:
+                                        pass
+
+                    # Fallback: reconstruct path using same sanitization as GameVaultConnector.install_game
+                    if not game_install_path:
+                        safe_title = "".join(c for c in item.game_title if c.isalnum() or c in (' ', '-', '_', '.')).strip()
+                        if not safe_title:
+                            safe_title = f'gamevault_{item.game_id}'
+                        reconstructed = os.path.join(install_path, safe_title)
+                        if os.path.isdir(reconstructed):
+                            game_install_path = reconstructed
+                            # Write marker for future identification
+                            try:
+                                marker_path = os.path.join(game_install_path, '.unifideck-id')
+                                with open(marker_path, 'w') as f:
+                                    f.write(str(item.game_id))
+                            except Exception as e:
+                                logger.warning(f"[DownloadComplete] Failed to write marker file: {e}")
+
+                    if game_install_path:
+                        exe_path = None
+                        work_dir = None
+                        exe_result = self.gamevault.find_game_executable(game_install_path)
+                        if exe_result:
+                            exe_path, work_dir = exe_result
+                            logger.info(f"[DownloadComplete] Found GameVault executable: {exe_path}")
+                        else:
+                            logger.warning(f"[DownloadComplete] No executable found for GameVault game {item.game_title}, registering with install path only")
+
+                        await self.shortcuts_manager.mark_installed(
+                            item.game_id, item.store, game_install_path, exe_path, work_dir
+                        )
+                        logger.info(f"[DownloadComplete] Marked {item.game_title} as installed")
+                        registration_success = True
+                    else:
+                        error_message = "Could not find GameVault install folder"
+                        logger.error(f"[DownloadComplete] {error_message} for {item.game_title}")
                 elif item.store == 'microsoft':
                     # xCloud games are streamed, not downloaded — this should not be reached
                     logger.warning(f"[DownloadComplete] Microsoft xCloud game download complete handler called for {item.game_title} — unexpected")

@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import time
 import zipfile
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 try:
     import aiohttp
@@ -628,6 +628,14 @@ class GameVaultConnector(Store):
             if progress_callback:
                 await progress_callback({'phase': 'complete', 'phase_message': 'Installation complete'})
 
+            # Write marker for post-download identification
+            try:
+                marker_path = os.path.join(game_dir, '.unifideck-id')
+                with open(marker_path, 'w') as f:
+                    f.write(str(game_id))
+            except Exception as e:
+                logger.warning(f"[GameVault] Failed to write .unifideck-id marker: {e}")
+
             logger.info(f"[GameVault] Game {game_id} installed to {game_dir}")
             return {'success': True, 'install_path': game_dir}
 
@@ -681,3 +689,65 @@ class GameVaultConnector(Store):
         """Synchronous zip extraction (run in executor)"""
         with zipfile.ZipFile(archive_path, 'r') as zf:
             zf.extractall(dest_dir)
+
+    def find_game_executable(self, install_path: str) -> Optional[Tuple[str, str]]:
+        """Find game executable in an extracted GameVault game directory.
+
+        Returns:
+            Tuple of (exe_path, work_dir) or None if no executable found.
+        """
+        # Known non-game executables to skip
+        skip_patterns = {
+            'unins000', 'uninstall', 'unitycrashandler', 'ue4prereqsetup',
+            'dxsetup', 'vcredist', 'dotnetfx', 'directx', 'setup',
+            'installer', 'redist', 'crashreport', 'bugreport',
+            'ue4-shootergame-win64-test',
+        }
+
+        candidates = []
+
+        try:
+            for depth, (dirpath, dirnames, filenames) in enumerate(os.walk(install_path)):
+                # Limit search depth to 3 levels
+                rel = os.path.relpath(dirpath, install_path)
+                if rel != '.' and rel.count(os.sep) >= 3:
+                    dirnames.clear()
+                    continue
+
+                level = 0 if rel == '.' else rel.count(os.sep) + 1
+
+                for fname in filenames:
+                    if not fname.lower().endswith('.exe'):
+                        continue
+
+                    name_lower = fname.lower().replace('.exe', '')
+
+                    # Skip known non-game executables
+                    if any(skip in name_lower for skip in skip_patterns):
+                        continue
+
+                    full_path = os.path.join(dirpath, fname)
+                    candidates.append((full_path, level, fname))
+
+        except Exception as e:
+            logger.error(f"[GameVault] Error scanning for executables: {e}")
+            return None
+
+        if not candidates:
+            return None
+
+        # Sort: prefer shallower depth, then larger file size as tiebreaker
+        def sort_key(item):
+            path, level, fname = item
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            return (level, -size)
+
+        candidates.sort(key=sort_key)
+
+        exe_path = candidates[0][0]
+        work_dir = os.path.dirname(exe_path)
+        logger.info(f"[GameVault] Found executable: {exe_path}")
+        return (exe_path, work_dir)
